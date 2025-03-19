@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/oauth2"
 	"io"
 	"log"
@@ -116,13 +118,26 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	span := trace.SpanFromContext(ctx)
+	if span.IsRecording() {
+		_, span = span.TracerProvider().Tracer("kahn").Start(
+			ctx,
+			"http request",
+		)
+		defer span.End()
+	}
 
 	// todo: add ratelimiting etc
 
 	req, err := getHttpRequest(ctx, request, *c.baseURL)
 	if err != nil {
+		span.RecordError(err, trace.WithStackTrace(true))
 		return err
 	}
+	span.SetAttributes(
+		attribute.String("http.method", req.Method),
+		attribute.String("http.url", req.URL.String()),
+	)
 
 	switch c.authType {
 	case authTypeBasic:
@@ -144,6 +159,8 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err, trace.WithStackTrace(true))
+
 		if c.debug {
 			log.Printf("Request failed: %s", err.Error())
 		}
@@ -151,11 +168,13 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 		if attempt < c.maxRetries {
 			time.Sleep(100 * time.Millisecond)
 			ctx = context.WithValue(ctx, contextKeyAttempt, attempt+1)
+			span.End()
 			return c.Do(ctx, request, response)
 		}
 
 		return fmt.Errorf("failed to do http request: %w", err)
 	}
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 
 	// we always run the dump response so we have a no-op io.Reader to read the body
 	dump, _ := httputil.DumpResponse(resp, true)
@@ -182,6 +201,7 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 		}
 		errResponse.Parent = errors.Join(errs...)
 
+		span.RecordError(err, trace.WithStackTrace(true))
 		return *errResponse
 	}
 
@@ -194,12 +214,14 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 		possibleStructs = append(possibleStructs, &e)
 	}
 	if err := c.Unmarshal(resp.Body, possibleStructs...); err != nil {
+		span.RecordError(err, trace.WithStackTrace(true))
 		return NewErrorResponse("failed to unmarshal response", resp, err)
 	}
 
 	// todo: untested, since our test api has no error response bodies
 	for _, e := range errorStructs {
 		if e.Error() != "" {
+			span.RecordError(err, trace.WithStackTrace(true))
 			return NewErrorResponse("error in response", resp, e)
 		}
 	}
