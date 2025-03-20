@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httputil"
 	"net/url"
 	"path"
@@ -34,33 +35,38 @@ const (
 	authTypeBasic
 	authTypeApiKey
 	authTypeOAuth2
+	authTypePreflight
 )
 
 type (
 	client struct {
 		httpClient            *http.Client
 		baseClient            *http.Client
+		parentClient          Client
 		debug                 bool
 		userAgent             string
 		mediaType             string
 		charset               string
 		baseURL               *url.URL
 		disallowUnknownFields bool
+		useCookies            bool
 
-		authType         int
-		userName         string
-		password         string
-		keyHeader        string
-		keyValue         string
-		maxRetries       int
-		tokenSource      oauth2.TokenSource
-		jsoniterInstance jsoniter.API
+		authType          int
+		userName          string
+		password          string
+		keyHeader         string
+		keyValue          string
+		maxRetries        int
+		tokenSource       oauth2.TokenSource
+		jsoniterInstance  jsoniter.API
+		preflightAuthFunc func(req *http.Request, client Client) (*http.Request, error)
 	}
 
 	Client interface {
 		ApplyOption(options Option)
 		Do(ctx context.Context, request Request, response interface{}) error
 		GetJsoniter() jsoniter.API
+		GetParentClient() Client
 
 		private() // just here to make sure only our package can implement this interface
 	}
@@ -80,6 +86,11 @@ type (
 	RequestWithBody interface {
 		Request
 		Body() any
+	}
+
+	RequestWithAuthPreference interface {
+		Request
+		SkipAuth() bool
 	}
 
 	ContextKey string
@@ -111,6 +122,10 @@ func NewClient(opts ...Option) Client {
 	return c
 }
 
+func (c *client) GetParentClient() Client {
+	return c.parentClient
+}
+
 func (c *client) Do(ctx context.Context, request Request, response interface{}) error {
 	if c.baseURL == nil {
 		return errors.New("client base URL not set")
@@ -127,6 +142,14 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 		defer span.End()
 	}
 
+	if c.useCookies {
+		if c.httpClient.Jar == nil {
+			c.httpClient.Jar, _ = cookiejar.New(nil)
+		}
+	} else {
+		c.httpClient.Jar = nil
+	}
+
 	// todo: add ratelimiting etc
 
 	req, err := getHttpRequest(ctx, request, *c.baseURL)
@@ -139,12 +162,27 @@ func (c *client) Do(ctx context.Context, request Request, response interface{}) 
 		attribute.String("http.url", req.URL.String()),
 	)
 
-	switch c.authType {
-	case authTypeBasic:
-		req.SetBasicAuth(c.userName, c.password)
-	case authTypeApiKey:
-		req.Header.Add(c.keyHeader, c.keyValue)
-	default:
+	skipAuth := false
+	if reqWithAuthPreference, ok := request.(RequestWithAuthPreference); ok {
+		skipAuth = reqWithAuthPreference.SkipAuth()
+	}
+
+	if !skipAuth {
+		switch c.authType {
+		case authTypeBasic:
+			req.SetBasicAuth(c.userName, c.password)
+		case authTypeApiKey:
+			req.Header.Add(c.keyHeader, c.keyValue)
+		case authTypePreflight:
+			if c.preflightAuthFunc != nil {
+				req, err = c.preflightAuthFunc(req, c)
+				if err != nil {
+					span.RecordError(err, trace.WithStackTrace(true))
+					return err
+				}
+			}
+		default:
+		}
 	}
 
 	// set other headers

@@ -105,3 +105,24 @@ func WithMaxRetries(maxRetries int) Option {
 		client.maxRetries = maxRetries
 	}
 }
+
+func WithUseCookies(useCookies bool) Option {
+	return func(client *client) {
+		client.useCookies = useCookies
+	}
+}
+
+func WithParentClient(parent Client) Option {
+	return func(client *client) {
+		client.parentClient = parent
+	}
+}
+
+// WithPreflightAuth sets the client to use preflight authentication. The given function will be called before each request
+// you can get the parent client by calling `GetParentClient()` on the given client, if registered with the WithParentClient option
+func WithPreflightAuth(authFunc func(req *http.Request, client Client) (*http.Request, error)) Option {
+	return func(client *client) {
+		client.authType = authTypePreflight
+		client.preflightAuthFunc = authFunc
+	}
+}
