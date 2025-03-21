@@ -378,6 +378,10 @@ func getRequestBody(r Request) (io.Reader, error) {
 	return body, nil
 }
 
+type isZeroer interface {
+	IsZero() bool
+}
+
 func getTaggedFields(elem interface{}, tag string) map[string]interface{} {
 	fields := make(map[string]interface{})
 	v := reflect.ValueOf(elem)
@@ -389,18 +393,26 @@ func getTaggedFields(elem interface{}, tag string) map[string]interface{} {
 	}
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if tagValue, ok := field.Tag.Lookup(tag); ok {
+		field := v.Field(i)
+		if tagValue, ok := t.Field(i).Tag.Lookup(tag); ok {
 			parts := strings.Split(tagValue, ",")
 			tagValue = parts[0]
-			if slices.Contains(parts, "omitempty") && v.Field(i).IsZero() {
+
+			if field.Kind() == reflect.Pointer && field.IsNil() {
 				continue
+			} else if field.Kind() == reflect.Pointer {
+				field = field.Elem()
 			}
-			if v.Field(i).Kind() == reflect.Pointer && !v.Field(i).IsNil() {
-				fields[tagValue] = v.Field(i).Elem().Interface()
-			} else {
-				fields[tagValue] = v.Field(i).Interface()
+			raw := field.Interface()
+			if slices.Contains(parts, "omitempty") {
+				if field.IsZero() {
+					continue
+				}
+				if zeroer, ok := raw.(isZeroer); ok && zeroer.IsZero() {
+					continue
+				}
 			}
+			fields[tagValue] = raw
 		}
 	}
 
